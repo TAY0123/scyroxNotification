@@ -1936,7 +1936,9 @@ version = "0.1.0"
 dependencies = [
  "hidapi",
  "notify-rust",
+ "serde",
  "tao",
+ "toml",
  "tray-icon",
 ]
 

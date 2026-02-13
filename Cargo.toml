@@ -6,5 +6,7 @@ edition = "2024"
 [dependencies]
 hidapi = "2.6"
 notify-rust = "4"
+serde = { version = "1", features = ["derive"] }
 tao = "0.30"
+toml = "0.8"
 tray-icon = "0.19"

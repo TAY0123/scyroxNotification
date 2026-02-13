@@ -1,8 +1,11 @@
 use hidapi::{DeviceInfo, HidApi, HidDevice};
 use notify_rust::Notification;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error;
 use std::ffi::CString;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tao::event::{Event, StartCause};
@@ -26,7 +29,7 @@ const MAX_RETRIES: usize = 8;
 const DEFAULT_TIMEOUT_MS: u64 = 350;
 const FLASH_TIMEOUT_MS: u64 = 600;
 const LOW_BATTERY_THRESHOLD: u8 = 20;
-const POLL_INTERVAL_SECS: u64 = 5;
+const CONFIG_FILE_NAME: &str = "tray_config.toml";
 
 #[derive(Debug, Clone, Copy)]
 struct BatteryReadout {
@@ -86,11 +89,66 @@ struct TrayRuntime {
     tray_icon: Option<TrayIcon>,
     menu_state: TrayMenuState,
     selected_device_path: Option<CString>,
+    poll_interval_secs: u64,
     notify_on_change: bool,
     low_battery_notified: bool,
     last_report: Option<ReadResult>,
     status_text: String,
     next_poll: Instant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppConfig {
+    poll_interval_secs: u64,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: 5,
+        }
+    }
+}
+
+impl AppConfig {
+    fn load_or_create() -> Result<Self, AnyError> {
+        let path = config_path()?;
+
+        if !path.exists() {
+            let cfg = Self::default();
+            cfg.write_to_path(&path)?;
+            return Ok(cfg);
+        }
+
+        let raw = fs::read_to_string(&path)?;
+        let parsed = toml::from_str::<Self>(&raw);
+        match parsed {
+            Ok(cfg) => {
+                let sanitized = cfg.sanitized();
+                if sanitized.poll_interval_secs != cfg.poll_interval_secs {
+                    sanitized.write_to_path(&path)?;
+                }
+                Ok(sanitized)
+            }
+            Err(_) => {
+                let cfg = Self::default();
+                cfg.write_to_path(&path)?;
+                Ok(cfg)
+            }
+        }
+    }
+
+    fn sanitized(&self) -> Self {
+        Self {
+            poll_interval_secs: self.poll_interval_secs.clamp(1, 3600),
+        }
+    }
+
+    fn write_to_path(&self, path: &Path) -> Result<(), AnyError> {
+        let serialized = toml::to_string_pretty(self)?;
+        fs::write(path, serialized)?;
+        Ok(())
+    }
 }
 
 fn main() -> Result<(), AnyError> {
@@ -273,6 +331,7 @@ fn cmd_read(index: Option<usize>) -> Result<(), AnyError> {
 }
 
 fn run_tray_mode() -> Result<(), AnyError> {
+    let config = AppConfig::load_or_create()?;
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
     let proxy = event_loop.create_proxy();
@@ -286,7 +345,7 @@ fn run_tray_mode() -> Result<(), AnyError> {
         let _ = proxy.send_event(UserEvent::Menu(event));
     }));
 
-    let mut app = TrayRuntime::new()?;
+    let mut app = TrayRuntime::new(config)?;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(app.next_poll);
@@ -318,7 +377,7 @@ fn run_tray_mode() -> Result<(), AnyError> {
 }
 
 impl TrayRuntime {
-    fn new() -> Result<Self, AnyError> {
+    fn new(config: AppConfig) -> Result<Self, AnyError> {
         let mut api = HidApi::new()?;
         api.refresh_devices()?;
 
@@ -338,11 +397,12 @@ impl TrayRuntime {
             tray_icon: None,
             menu_state,
             selected_device_path,
+            poll_interval_secs: config.poll_interval_secs,
             notify_on_change,
             low_battery_notified: false,
             last_report: None,
             status_text,
-            next_poll: Instant::now() + Duration::from_secs(1),
+            next_poll: Instant::now() + Duration::from_secs(config.poll_interval_secs),
         })
     }
 
@@ -404,7 +464,7 @@ impl TrayRuntime {
     }
 
     fn poll_once(&mut self) {
-        self.next_poll = Instant::now() + Duration::from_secs(POLL_INTERVAL_SECS);
+        self.next_poll = Instant::now() + Duration::from_secs(self.poll_interval_secs);
 
         if self.selected_device_path.is_none() {
             self.selected_device_path = first_responsive_device_path(&self.api);
@@ -978,4 +1038,8 @@ fn product_ids_hex() -> String {
         .map(|pid| format!("0x{pid:04X}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn config_path() -> Result<PathBuf, AnyError> {
+    Ok(env::current_dir()?.join(CONFIG_FILE_NAME))
 }
