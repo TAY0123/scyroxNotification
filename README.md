@@ -2,6 +2,7 @@
 <img width="124" height="128" alt="image" src="https://github.com/user-attachments/assets/e2aa7ffc-6345-4cc2-ab3b-e9cc87b64192" />
 
 Standalone Rust app for Scyrox mouse/dongle HID monitoring.
+Written using Codex, JS source is fetched from [https://www.scyrox.net/](https://www.scyrox.net/)
 
 It can:
 - Enumerate compatible HID interfaces.
