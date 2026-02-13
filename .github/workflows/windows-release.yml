@@ -27,6 +27,8 @@ jobs:
     env:
       BIN_NAME: scyrox_hid_reader.exe
       DIST_DIR: dist
+      WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
 
     steps:
       - name: Checkout
@@ -50,13 +52,13 @@ jobs:
           "poll_interval_secs = ${{ inputs.poll_interval_secs }}" | Set-Content "${env:DIST_DIR}/tray_config.toml"
 
       - name: Decode signing certificate
-        if: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+        if: ${{ env.WINDOWS_CERT_PFX_BASE64 != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         run: |
-          [IO.File]::WriteAllBytes("codesign.pfx", [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_PFX_BASE64 }}"))
+          [IO.File]::WriteAllBytes("codesign.pfx", [Convert]::FromBase64String("${env:WINDOWS_CERT_PFX_BASE64}"))
 
       - name: Sign executable
-        if: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+        if: ${{ env.WINDOWS_CERT_PFX_BASE64 != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         run: |
           $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction Stop |
@@ -65,14 +67,14 @@ jobs:
 
           & $signtool sign `
             /f "codesign.pfx" `
-            /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" `
+            /p "${env:WINDOWS_CERT_PASSWORD}" `
             /fd SHA256 `
             /td SHA256 `
             /tr "http://timestamp.digicert.com" `
             "${env:DIST_DIR}/${env:BIN_NAME}"
 
       - name: Verify signature
-        if: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+        if: ${{ env.WINDOWS_CERT_PFX_BASE64 != '' && env.WINDOWS_CERT_PASSWORD != '' }}
         shell: pwsh
         run: |
           $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction Stop |
