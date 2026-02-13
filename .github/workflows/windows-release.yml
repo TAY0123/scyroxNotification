@@ -1,0 +1,95 @@
+name: Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (example: v1.0.0)"
+        required: true
+        type: string
+      release_name:
+        description: "Release name"
+        required: true
+        type: string
+      poll_interval_secs:
+        description: "Default tray config poll interval seconds"
+        required: false
+        default: "5"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-sign-upload:
+    runs-on: windows-latest
+
+    env:
+      BIN_NAME: scyrox_hid_reader.exe
+      DIST_DIR: dist
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        shell: pwsh
+        run: cargo build --release
+
+      - name: Prepare release payload
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "${env:DIST_DIR}" -Force | Out-Null
+          Copy-Item "target/release/${env:BIN_NAME}" "${env:DIST_DIR}/${env:BIN_NAME}" -Force
+          "poll_interval_secs = ${{ inputs.poll_interval_secs }}" | Set-Content "${env:DIST_DIR}/tray_config.toml"
+
+      - name: Decode signing certificate
+        if: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("codesign.pfx", [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_PFX_BASE64 }}"))
+
+      - name: Sign executable
+        if: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction Stop |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          & $signtool sign `
+            /f "codesign.pfx" `
+            /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" `
+            /fd SHA256 `
+            /td SHA256 `
+            /tr "http://timestamp.digicert.com" `
+            "${env:DIST_DIR}/${env:BIN_NAME}"
+
+      - name: Verify signature
+        if: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction Stop |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          & $signtool verify /pa "${env:DIST_DIR}/${env:BIN_NAME}"
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "${env:DIST_DIR}/*" -DestinationPath "${env:DIST_DIR}/scyrox_hid_reader-${{ inputs.tag }}-windows-x64.zip" -Force
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.release_name }}
+          generate_release_notes: true
+          files: |
+            dist/scyrox_hid_reader-${{ inputs.tag }}-windows-x64.zip
