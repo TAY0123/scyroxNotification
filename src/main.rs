@@ -1,8 +1,14 @@
 use hidapi::{DeviceInfo, HidApi, HidDevice};
+use notify_rust::Notification;
 use std::env;
 use std::error::Error;
+use std::ffi::CString;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tao::event::{Event, StartCause};
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 type AnyError = Box<dyn Error + Send + Sync>;
 
@@ -19,6 +25,8 @@ const CMD_READ_FLASH: u8 = 8;
 const MAX_RETRIES: usize = 8;
 const DEFAULT_TIMEOUT_MS: u64 = 350;
 const FLASH_TIMEOUT_MS: u64 = 600;
+const LOW_BATTERY_THRESHOLD: u8 = 20;
+const POLL_INTERVAL_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Copy)]
 struct BatteryReadout {
@@ -38,6 +46,12 @@ struct DeviceIdentity {
     product: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct CandidateDevice {
+    path: CString,
+    identity: DeviceIdentity,
+}
+
 #[derive(Debug)]
 struct ReadResult {
     cid: u8,
@@ -52,10 +66,38 @@ struct ReadResult {
     dpi_slots: [u32; 8],
 }
 
+#[derive(Debug)]
+enum UserEvent {
+    Tray,
+    Menu(tray_icon::menu::MenuEvent),
+}
+
+struct TrayMenuState {
+    menu: Menu,
+    status_item: MenuItem,
+    device_paths: Vec<CString>,
+    notify_changes_item: CheckMenuItem,
+    refresh_item: MenuItem,
+    quit_item: MenuItem,
+}
+
+struct TrayRuntime {
+    api: HidApi,
+    tray_icon: Option<TrayIcon>,
+    menu_state: TrayMenuState,
+    selected_device_path: Option<CString>,
+    notify_on_change: bool,
+    low_battery_notified: bool,
+    last_report: Option<ReadResult>,
+    status_text: String,
+    next_poll: Instant,
+}
+
 fn main() -> Result<(), AnyError> {
     let args: Vec<String> = env::args().collect();
+
     if args.len() < 2 {
-        print_help();
+        run_tray_mode()?;
         return Ok(());
     }
 
@@ -67,6 +109,9 @@ fn main() -> Result<(), AnyError> {
         "read" => {
             let index = parse_index_arg(&args[2..])?;
             cmd_read(index)?;
+        }
+        "tray" => {
+            run_tray_mode()?;
         }
         _ => {
             print_help();
@@ -80,6 +125,7 @@ fn print_help() {
     println!("scyrox_hid_reader");
     println!();
     println!("Usage:");
+    println!("  scyrox_hid_reader tray");
     println!("  scyrox_hid_reader list [--no-probe]");
     println!("  scyrox_hid_reader read [--index N]");
     println!();
@@ -88,8 +134,6 @@ fn print_help() {
         "  - Filters default to VID=0x{VENDOR_ID:04X} and PIDs={}.",
         product_ids_hex()
     );
-    println!("  - `list` probes each interface and highlights the recommended one.");
-    println!("  - `read` fetches battery, polling rate, and DPI from the device.");
 }
 
 fn parse_index_arg(args: &[String]) -> Result<Option<usize>, AnyError> {
@@ -228,6 +272,408 @@ fn cmd_read(index: Option<usize>) -> Result<(), AnyError> {
     Ok(())
 }
 
+fn run_tray_mode() -> Result<(), AnyError> {
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+
+    let proxy = event_loop.create_proxy();
+    TrayIconEvent::set_event_handler(Some(move |event| {
+        let _ = event;
+        let _ = proxy.send_event(UserEvent::Tray);
+    }));
+
+    let proxy = event_loop.create_proxy();
+    MenuEvent::set_event_handler(Some(move |event| {
+        let _ = proxy.send_event(UserEvent::Menu(event));
+    }));
+
+    let mut app = TrayRuntime::new()?;
+
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::WaitUntil(app.next_poll);
+
+        match event {
+            Event::NewEvents(cause) => {
+                if matches!(cause, StartCause::Init) {
+                    if let Err(err) = app.create_tray_icon() {
+                        eprintln!("failed to create tray icon: {err}");
+                        *control_flow = ControlFlow::Exit;
+                        return;
+                    }
+                    app.poll_once();
+                } else if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+                    app.poll_once();
+                }
+                *control_flow = ControlFlow::WaitUntil(app.next_poll);
+            }
+            Event::UserEvent(UserEvent::Menu(menu_event)) => {
+                if app.handle_menu_event(menu_event) {
+                    app.tray_icon.take();
+                    *control_flow = ControlFlow::Exit;
+                }
+            }
+            Event::UserEvent(UserEvent::Tray) => {}
+            _ => {}
+        }
+    });
+}
+
+impl TrayRuntime {
+    fn new() -> Result<Self, AnyError> {
+        let mut api = HidApi::new()?;
+        api.refresh_devices()?;
+
+        let selected_device_path = first_responsive_device_path(&api);
+        let status_text = "Status: starting...".to_string();
+        let notify_on_change = true;
+
+        let menu_state = build_tray_menu(
+            &api,
+            selected_device_path.as_ref(),
+            notify_on_change,
+            &status_text,
+        )?;
+
+        Ok(Self {
+            api,
+            tray_icon: None,
+            menu_state,
+            selected_device_path,
+            notify_on_change,
+            low_battery_notified: false,
+            last_report: None,
+            status_text,
+            next_poll: Instant::now() + Duration::from_secs(1),
+        })
+    }
+
+    fn create_tray_icon(&mut self) -> Result<(), AnyError> {
+        let icon = build_battery_icon(None, false)?;
+        let tray_icon = TrayIconBuilder::new()
+            .with_menu(Box::new(self.menu_state.menu.clone()))
+            .with_tooltip("Scyrox monitor")
+            .with_icon(icon)
+            .build()?;
+
+        self.tray_icon = Some(tray_icon);
+        Ok(())
+    }
+
+    fn rebuild_menu(&mut self) -> Result<(), AnyError> {
+        self.api.refresh_devices()?;
+        self.menu_state = build_tray_menu(
+            &self.api,
+            self.selected_device_path.as_ref(),
+            self.notify_on_change,
+            &self.status_text,
+        )?;
+
+        if let Some(tray_icon) = &self.tray_icon {
+            tray_icon.set_menu(Some(Box::new(self.menu_state.menu.clone())));
+        }
+
+        Ok(())
+    }
+
+    fn handle_menu_event(&mut self, event: tray_icon::menu::MenuEvent) -> bool {
+        if event.id == self.menu_state.quit_item.id() {
+            return true;
+        }
+
+        if event.id == self.menu_state.refresh_item.id() {
+            let _ = self.rebuild_menu();
+            return false;
+        }
+
+        if event.id == self.menu_state.notify_changes_item.id() {
+            self.notify_on_change = self.menu_state.notify_changes_item.is_checked();
+            return false;
+        }
+
+        if let Some(index_text) = event.id.as_ref().strip_prefix("device-") {
+            if let Ok(index) = index_text.parse::<usize>() {
+                if let Some(path) = self.menu_state.device_paths.get(index) {
+                    self.selected_device_path = Some(path.clone());
+                    self.last_report = None;
+                    self.low_battery_notified = false;
+                    let _ = self.rebuild_menu();
+                }
+            }
+        }
+
+        false
+    }
+
+    fn poll_once(&mut self) {
+        self.next_poll = Instant::now() + Duration::from_secs(POLL_INTERVAL_SECS);
+
+        if self.selected_device_path.is_none() {
+            self.selected_device_path = first_responsive_device_path(&self.api);
+            if self.selected_device_path.is_some() {
+                let _ = self.rebuild_menu();
+            }
+        }
+
+        let Some(path) = self.selected_device_path.clone() else {
+            self.set_disconnected_status("No compatible device selected");
+            return;
+        };
+
+        match self.read_selected(&path) {
+            Ok((identity, result)) => {
+                self.update_from_result(&identity, &result);
+                self.last_report = Some(result);
+            }
+            Err(err) => {
+                self.set_disconnected_status(&format!("Disconnected ({err})"));
+                self.selected_device_path = first_responsive_device_path(&self.api);
+                let _ = self.rebuild_menu();
+            }
+        }
+    }
+
+    fn set_disconnected_status(&mut self, detail: &str) {
+        self.status_text = format!("Status: {detail}");
+        self.menu_state.status_item.set_text(&self.status_text);
+        if let Some(tray_icon) = &self.tray_icon {
+            let _ = tray_icon.set_tooltip(Some("Scyrox monitor: disconnected"));
+            if let Ok(icon) = build_battery_icon(None, false) {
+                let _ = tray_icon.set_icon(Some(icon));
+            }
+        }
+    }
+
+    fn read_selected(&mut self, path: &CString) -> Result<(DeviceIdentity, ReadResult), AnyError> {
+        self.api.refresh_devices()?;
+
+        let target = scan_candidates(&self.api)
+            .into_iter()
+            .find(|candidate| candidate.path.as_bytes() == path.as_bytes())
+            .ok_or("selected device is no longer present")?;
+
+        let device = self.api.open_path(&target.path)?;
+        let result = read_device(&device)?;
+        Ok((target.identity, result))
+    }
+
+    fn update_from_result(&mut self, identity: &DeviceIdentity, result: &ReadResult) {
+        let battery = result.battery;
+        let battery_level = battery.map(|b| b.level);
+        let charging = battery.map(|b| b.charging).unwrap_or(false);
+
+        self.status_text = format!(
+            "Status: Batt {}% | DPI {} | {} Hz",
+            battery_level
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            result.current_dpi,
+            result.polling_hz
+        );
+        self.menu_state.status_item.set_text(&self.status_text);
+
+        if let Some(tray_icon) = &self.tray_icon {
+            let tooltip = format!(
+                "{}\nBattery: {}%{}\nDPI: {}\nPolling: {} Hz",
+                identity.product.as_deref().unwrap_or("Scyrox Device"),
+                battery_level
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                if charging { " (charging)" } else { "" },
+                result.current_dpi,
+                result.polling_hz
+            );
+            let _ = tray_icon.set_tooltip(Some(&tooltip));
+            if let Ok(icon) = build_battery_icon(battery_level, charging) {
+                let _ = tray_icon.set_icon(Some(icon));
+            }
+        }
+
+        if let Some(previous) = &self.last_report {
+            if self.notify_on_change
+                && (previous.current_dpi != result.current_dpi
+                    || previous.polling_hz != result.polling_hz)
+            {
+                let _ = send_notification(
+                    "Mouse setting changed",
+                    &format!(
+                        "DPI: {} | Polling: {} Hz",
+                        result.current_dpi, result.polling_hz
+                    ),
+                );
+            }
+        }
+
+        if let Some(bat) = battery {
+            if bat.level <= LOW_BATTERY_THRESHOLD && !self.low_battery_notified {
+                let _ = send_notification(
+                    "Mouse battery low",
+                    &format!("Battery is at {}%", bat.level),
+                );
+                self.low_battery_notified = true;
+            }
+            if bat.level > LOW_BATTERY_THRESHOLD + 5 {
+                self.low_battery_notified = false;
+            }
+        }
+    }
+}
+
+fn build_tray_menu(
+    api: &HidApi,
+    selected_path: Option<&CString>,
+    notify_on_change: bool,
+    status_text: &str,
+) -> Result<TrayMenuState, AnyError> {
+    let menu = Menu::new();
+
+    let status_item = MenuItem::with_id("status", status_text, false, None);
+    menu.append(&status_item)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+
+    let candidates = scan_candidates(api);
+    let mut device_paths = Vec::new();
+
+    if candidates.is_empty() {
+        menu.append(&MenuItem::new("No compatible devices found", false, None))?;
+    } else {
+        for (index, candidate) in candidates.iter().enumerate() {
+            let selected = selected_path
+                .map(|p| p.as_bytes() == candidate.path.as_bytes())
+                .unwrap_or(false);
+
+            let label = format!(
+                "[{}] {:04X}:{:04X} iface {} {:04X}:{:04X}",
+                index,
+                candidate.identity.vendor_id,
+                candidate.identity.product_id,
+                candidate.identity.interface_number,
+                candidate.identity.usage_page,
+                candidate.identity.usage
+            );
+
+            let item =
+                CheckMenuItem::with_id(format!("device-{index}"), label, true, selected, None);
+            menu.append(&item)?;
+            device_paths.push(candidate.path.clone());
+        }
+    }
+
+    menu.append(&PredefinedMenuItem::separator())?;
+
+    let notify_changes_item = CheckMenuItem::with_id(
+        "toggle-notify-change",
+        "Notify on DPI/polling changes",
+        true,
+        notify_on_change,
+        None,
+    );
+    menu.append(&notify_changes_item)?;
+
+    menu.append(&PredefinedMenuItem::separator())?;
+
+    let refresh_item = MenuItem::with_id("refresh-devices", "Refresh devices", true, None);
+    let quit_item = MenuItem::with_id("quit", "Quit", true, None);
+    menu.append(&refresh_item)?;
+    menu.append(&quit_item)?;
+
+    Ok(TrayMenuState {
+        menu,
+        status_item,
+        device_paths,
+        notify_changes_item,
+        refresh_item,
+        quit_item,
+    })
+}
+
+fn scan_candidates(api: &HidApi) -> Vec<CandidateDevice> {
+    api.device_list()
+        .filter(|info| is_target_device(info))
+        .map(|info| CandidateDevice {
+            path: info.path().to_owned(),
+            identity: identity_from_info(info),
+        })
+        .collect()
+}
+
+fn first_responsive_device_path(api: &HidApi) -> Option<CString> {
+    for candidate in scan_candidates(api) {
+        let Ok(device) = api.open_path(&candidate.path) else {
+            continue;
+        };
+        drain_input(&device);
+        if get_online(&device).is_ok() {
+            return Some(candidate.path);
+        }
+    }
+    None
+}
+
+fn send_notification(summary: &str, body: &str) -> Result<(), AnyError> {
+    Notification::new().summary(summary).body(body).show()?;
+    Ok(())
+}
+
+fn build_battery_icon(level: Option<u8>, charging: bool) -> Result<Icon, AnyError> {
+    const W: usize = 32;
+    const H: usize = 32;
+    let mut rgba = vec![0u8; W * H * 4];
+
+    let frame = [220u8, 220, 220, 255];
+    let empty = [45u8, 45, 45, 220];
+
+    fill_rect(&mut rgba, W, H, 6, 8, 20, 16, frame);
+    fill_rect(&mut rgba, W, H, 26, 13, 2, 6, frame);
+    fill_rect(&mut rgba, W, H, 8, 10, 16, 12, empty);
+
+    match level {
+        Some(percent) => {
+            let p = percent.min(100);
+            let fill_width = ((u32::from(p) * 16) / 100) as usize;
+            let color = if p <= 20 {
+                [220u8, 55, 55, 255]
+            } else if p <= 50 {
+                [230u8, 180, 40, 255]
+            } else {
+                [70u8, 190, 80, 255]
+            };
+            if fill_width > 0 {
+                fill_rect(&mut rgba, W, H, 8, 10, fill_width, 12, color);
+            }
+        }
+        None => {
+            fill_rect(&mut rgba, W, H, 8, 10, 16, 12, [110u8, 110, 110, 255]);
+        }
+    }
+
+    if charging {
+        fill_rect(&mut rgba, W, H, 14, 11, 3, 4, [80u8, 220, 255, 255]);
+        fill_rect(&mut rgba, W, H, 15, 15, 3, 4, [80u8, 220, 255, 255]);
+        fill_rect(&mut rgba, W, H, 13, 19, 3, 2, [80u8, 220, 255, 255]);
+    }
+
+    Ok(Icon::from_rgba(rgba, W as u32, H as u32)?)
+}
+
+fn fill_rect(
+    image: &mut [u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: [u8; 4],
+) {
+    let x_end = (x + w).min(width);
+    let y_end = (y + h).min(height);
+    for yy in y..y_end {
+        for xx in x..x_end {
+            let idx = (yy * width + xx) * 4;
+            image[idx..idx + 4].copy_from_slice(&color);
+        }
+    }
+}
+
 fn collect_candidates(api: &HidApi) -> Vec<&DeviceInfo> {
     api.device_list().filter(|d| is_target_device(d)).collect()
 }
@@ -291,6 +737,7 @@ fn read_device(device: &HidDevice) -> Result<ReadResult, AnyError> {
     } else {
         None
     };
+
     let mut dpi_slots = [0u32; 8];
     for (slot, dpi_value) in dpi_slots.iter_mut().enumerate() {
         *dpi_value = decode_dpi(&flash, slot);

@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 hidapi = "2.6"
+notify-rust = "4"
+tao = "0.30"
+tray-icon = "0.19"
