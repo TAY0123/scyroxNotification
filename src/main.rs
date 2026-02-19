@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 type AnyError = Box<dyn Error + Send + Sync>;
@@ -24,12 +24,15 @@ const CMD_ENCRYPTION: u8 = 1;
 const CMD_PC_DRIVER_STATUS: u8 = 2;
 const CMD_DEVICE_ONLINE: u8 = 3;
 const CMD_BATTERY_LEVEL: u8 = 4;
+const CMD_WRITE_FLASH: u8 = 7;
 const CMD_READ_FLASH: u8 = 8;
 const MAX_RETRIES: usize = 8;
 const DEFAULT_TIMEOUT_MS: u64 = 350;
 const FLASH_TIMEOUT_MS: u64 = 600;
 const LOW_BATTERY_THRESHOLD: u8 = 20;
 const CONFIG_FILE_NAME: &str = "tray_config.toml";
+const FLASH_ADDR_REPORT_RATE: u16 = 0;
+const POLLING_RATE_OPTIONS: [u32; 7] = [125, 250, 500, 1000, 2000, 4000, 8000];
 
 #[derive(Debug, Clone, Copy)]
 struct BatteryReadout {
@@ -75,13 +78,36 @@ enum UserEvent {
     Menu(tray_icon::menu::MenuEvent),
 }
 
+struct PollingRateMenuItem {
+    hz: u32,
+    item: CheckMenuItem,
+}
+
 struct TrayMenuState {
     menu: Menu,
     status_item: MenuItem,
     device_paths: Vec<CString>,
+    polling_rate_items: Vec<PollingRateMenuItem>,
     notify_changes_item: CheckMenuItem,
     refresh_item: MenuItem,
     quit_item: MenuItem,
+}
+
+impl TrayMenuState {
+    fn sync_polling_items(
+        &self,
+        current_polling_hz: Option<u32>,
+        max_polling_hz: u32,
+        has_selected_device: bool,
+    ) {
+        for entry in &self.polling_rate_items {
+            let enabled = has_selected_device && entry.hz <= max_polling_hz;
+            entry.item.set_enabled(enabled);
+            entry
+                .item
+                .set_checked(current_polling_hz.map(|hz| hz == entry.hz).unwrap_or(false));
+        }
+    }
 }
 
 struct TrayRuntime {
@@ -90,6 +116,8 @@ struct TrayRuntime {
     menu_state: TrayMenuState,
     selected_device_path: Option<CString>,
     poll_interval_secs: u64,
+    current_polling_hz: Option<u32>,
+    max_polling_hz: u32,
     notify_on_change: bool,
     low_battery_notified: bool,
     last_report: Option<ReadResult>,
@@ -390,6 +418,8 @@ impl TrayRuntime {
             selected_device_path.as_ref(),
             notify_on_change,
             &status_text,
+            None,
+            1000,
         )?;
 
         Ok(Self {
@@ -398,6 +428,8 @@ impl TrayRuntime {
             menu_state,
             selected_device_path,
             poll_interval_secs: config.poll_interval_secs,
+            current_polling_hz: None,
+            max_polling_hz: 1000,
             notify_on_change,
             low_battery_notified: false,
             last_report: None,
@@ -425,11 +457,19 @@ impl TrayRuntime {
             self.selected_device_path.as_ref(),
             self.notify_on_change,
             &self.status_text,
+            self.current_polling_hz,
+            self.max_polling_hz,
         )?;
 
         if let Some(tray_icon) = &self.tray_icon {
             tray_icon.set_menu(Some(Box::new(self.menu_state.menu.clone())));
         }
+
+        self.menu_state.sync_polling_items(
+            self.current_polling_hz,
+            self.max_polling_hz,
+            self.selected_device_path.is_some(),
+        );
 
         Ok(())
     }
@@ -449,15 +489,40 @@ impl TrayRuntime {
             return false;
         }
 
+        if let Some(hz_text) = event.id.as_ref().strip_prefix("polling-") {
+            if let Ok(hz) = hz_text.parse::<u32>() {
+                if let Err(err) = self.set_selected_polling_rate(hz) {
+                    self.set_disconnected_status(&format!("Polling change failed ({err})"));
+                } else if let Some(path) = self.selected_device_path.clone() {
+                    self.last_report = None;
+                    match self.read_selected(&path) {
+                        Ok((identity, result)) => {
+                            self.update_from_result(&identity, &result);
+                            self.last_report = Some(result);
+                        }
+                        Err(err) => {
+                            self.set_disconnected_status(&format!("Disconnected ({err})"));
+                            self.selected_device_path = first_responsive_device_path(&self.api);
+                        }
+                    }
+                }
+                let _ = self.rebuild_menu();
+            }
+            return false;
+        }
+
         if let Some(index_text) = event.id.as_ref().strip_prefix("device-") {
             if let Ok(index) = index_text.parse::<usize>() {
                 if let Some(path) = self.menu_state.device_paths.get(index) {
                     self.selected_device_path = Some(path.clone());
+                    self.current_polling_hz = None;
+                    self.max_polling_hz = 1000;
                     self.last_report = None;
                     self.low_battery_notified = false;
                     let _ = self.rebuild_menu();
                 }
             }
+            return false;
         }
 
         false
@@ -486,6 +551,9 @@ impl TrayRuntime {
             Err(err) => {
                 self.set_disconnected_status(&format!("Disconnected ({err})"));
                 self.selected_device_path = first_responsive_device_path(&self.api);
+                if self.selected_device_path.is_none() {
+                    self.max_polling_hz = 1000;
+                }
                 let _ = self.rebuild_menu();
             }
         }
@@ -494,12 +562,52 @@ impl TrayRuntime {
     fn set_disconnected_status(&mut self, detail: &str) {
         self.status_text = format!("Status: {detail}");
         self.menu_state.status_item.set_text(&self.status_text);
+        self.current_polling_hz = None;
+        self.menu_state.sync_polling_items(
+            self.current_polling_hz,
+            self.max_polling_hz,
+            self.selected_device_path.is_some(),
+        );
         if let Some(tray_icon) = &self.tray_icon {
             let _ = tray_icon.set_tooltip(Some("Scyrox monitor: disconnected"));
             if let Ok(icon) = build_battery_icon(None, false) {
                 let _ = tray_icon.set_icon(Some(icon));
             }
         }
+    }
+
+    fn set_selected_polling_rate(&mut self, hz: u32) -> Result<(), AnyError> {
+        if hz > self.max_polling_hz {
+            return Err(format!(
+                "{hz} Hz is not supported by this device (max {} Hz)",
+                self.max_polling_hz
+            )
+            .into());
+        }
+
+        let path = self
+            .selected_device_path
+            .clone()
+            .ok_or("no compatible device selected")?;
+
+        self.api.refresh_devices()?;
+        let target = scan_candidates(&self.api)
+            .into_iter()
+            .find(|candidate| candidate.path.as_bytes() == path.as_bytes())
+            .ok_or("selected device is no longer present")?;
+
+        let device = self.api.open_path(&target.path)?;
+        drain_input(&device);
+
+        if !get_online(&device)? {
+            return Err("device reported offline".into());
+        }
+
+        let _ = set_pc_driver_status(&device, 1);
+        let _ = run_encryption(&device)?;
+        set_polling_rate(&device, hz)?;
+
+        Ok(())
     }
 
     fn read_selected(&mut self, path: &CString) -> Result<(DeviceIdentity, ReadResult), AnyError> {
@@ -519,6 +627,13 @@ impl TrayRuntime {
         let battery = result.battery;
         let battery_level = battery.map(|b| b.level);
         let charging = battery.map(|b| b.charging).unwrap_or(false);
+        self.current_polling_hz = Some(result.polling_hz);
+        self.max_polling_hz = max_supported_polling_hz(result.device_type);
+        self.menu_state.sync_polling_items(
+            self.current_polling_hz,
+            self.max_polling_hz,
+            self.selected_device_path.is_some(),
+        );
 
         self.status_text = format!(
             "Status: Batt {}% | DPI {} | {} Hz",
@@ -582,6 +697,8 @@ fn build_tray_menu(
     selected_path: Option<&CString>,
     notify_on_change: bool,
     status_text: &str,
+    current_polling_hz: Option<u32>,
+    max_polling_hz: u32,
 ) -> Result<TrayMenuState, AnyError> {
     let menu = Menu::new();
 
@@ -589,11 +706,12 @@ fn build_tray_menu(
     menu.append(&status_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
 
+    let device_menu = Submenu::with_id("submenu-device", "Device", true);
     let candidates = scan_candidates(api);
     let mut device_paths = Vec::new();
 
     if candidates.is_empty() {
-        menu.append(&MenuItem::new("No compatible devices found", false, None))?;
+        device_menu.append(&MenuItem::new("No compatible devices found", false, None))?;
     } else {
         for (index, candidate) in candidates.iter().enumerate() {
             let selected = selected_path
@@ -612,10 +730,30 @@ fn build_tray_menu(
 
             let item =
                 CheckMenuItem::with_id(format!("device-{index}"), label, true, selected, None);
-            menu.append(&item)?;
+            device_menu.append(&item)?;
             device_paths.push(candidate.path.clone());
         }
     }
+    menu.append(&device_menu)?;
+
+    menu.append(&PredefinedMenuItem::separator())?;
+
+    let polling_menu = Submenu::with_id("submenu-polling", "Polling rate", true);
+    let mut polling_rate_items = Vec::new();
+    for hz in POLLING_RATE_OPTIONS {
+        let selected = current_polling_hz.map(|v| v == hz).unwrap_or(false);
+        let enabled = selected_path.is_some() && hz <= max_polling_hz;
+        let item = CheckMenuItem::with_id(
+            format!("polling-{hz}"),
+            format!("{hz} Hz"),
+            enabled,
+            selected,
+            None,
+        );
+        polling_menu.append(&item)?;
+        polling_rate_items.push(PollingRateMenuItem { hz, item });
+    }
+    menu.append(&polling_menu)?;
 
     menu.append(&PredefinedMenuItem::separator())?;
 
@@ -639,6 +777,7 @@ fn build_tray_menu(
         menu,
         status_item,
         device_paths,
+        polling_rate_items,
         notify_changes_item,
         refresh_item,
         quit_item,
@@ -892,6 +1031,45 @@ fn decode_polling_hz(raw: u8) -> u32 {
     } else {
         1000 / u32::from(raw)
     }
+}
+
+fn encode_polling_hz(hz: u32) -> Option<u8> {
+    match hz {
+        125 => Some(8),
+        250 => Some(4),
+        500 => Some(2),
+        1000 => Some(1),
+        2000 => Some(16),
+        4000 => Some(32),
+        8000 => Some(64),
+        _ => None,
+    }
+}
+
+fn max_supported_polling_hz(device_type: u8) -> u32 {
+    match device_type {
+        0 | 2 => 1000,
+        1 => 4000,
+        3 | 5 => 8000,
+        4 => 2000,
+        _ => 1000,
+    }
+}
+
+fn set_polling_rate(device: &HidDevice, hz: u32) -> Result<(), AnyError> {
+    let encoded = encode_polling_hz(hz).ok_or_else(|| format!("unsupported polling rate: {hz}"))?;
+
+    let mut request = [0u8; 16];
+    request[0] = CMD_WRITE_FLASH;
+    request[2] = (FLASH_ADDR_REPORT_RATE >> 8) as u8;
+    request[3] = (FLASH_ADDR_REPORT_RATE & 0xFF) as u8;
+    request[4] = 2;
+    request[5] = encoded;
+    request[6] = 85u8.wrapping_sub(encoded);
+    request[15] = checksum(&request);
+
+    let _ = exchange(device, request, Duration::from_millis(DEFAULT_TIMEOUT_MS))?;
+    Ok(())
 }
 
 fn decode_dpi(flash: &[u8], slot: usize) -> u32 {
